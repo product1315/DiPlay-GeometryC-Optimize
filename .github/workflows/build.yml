@@ -1,0 +1,96 @@
+name: Android APK Build
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/build.yml"
+      - "*.zip"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Extract source ZIP
+        shell: bash
+        run: |
+          set -e
+          mkdir -p source
+          ZIP_FILE="$(find . -maxdepth 1 -type f -iname '*.zip' | head -n 1)"
+          if [ -z "$ZIP_FILE" ]; then
+            echo "ERROR: No ZIP file found in repository root"
+            exit 1
+          fi
+          unzip -q "$ZIP_FILE" -d source
+          GRADLEW="$(find source -type f -name gradlew | head -n 1)"
+          if [ -z "$GRADLEW" ]; then
+            echo "ERROR: gradlew not found in ZIP"
+            find source -maxdepth 3 -type f | head -n 80
+            exit 1
+          fi
+          echo "PROJECT_DIR=$(dirname "$GRADLEW")" >> "$GITHUB_ENV"
+
+      - name: Fix legacy desugaring configuration
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          root = Path(os.environ["PROJECT_DIR"])
+          candidates = list(root.rglob("automotive/build.gradle.kts"))
+          if not candidates:
+              print("No automotive/build.gradle.kts found; skipping automatic patch.")
+              raise SystemExit(0)
+
+          p = candidates[0]
+          s = p.read_text()
+          if "isCoreLibraryDesugaringEnabled" not in s:
+              marker = "compileOptions {"
+              if marker not in s:
+                  raise SystemExit("Could not locate compileOptions in " + str(p))
+              s = s.replace(
+                  marker,
+                  marker + "\n        isCoreLibraryDesugaringEnabled = true",
+                  1
+              )
+
+          if "coreLibraryDesugaring(" not in s:
+              marker = "dependencies {"
+              if marker not in s:
+                  raise SystemExit("Could not locate dependencies in " + str(p))
+              s = s.replace(
+                  marker,
+                  marker + '\n    coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.5")',
+                  1
+              )
+
+          p.write_text(s)
+          print("Patched", p)
+          PY
+
+      - name: Build debug APK
+        shell: bash
+        run: |
+          set -e
+          cd "$PROJECT_DIR"
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: DiPlay-debug-APK
+          path: |
+            ${{ env.PROJECT_DIR }}/**/build/outputs/apk/**/*.apk
+          if-no-files-found: error
